@@ -7,7 +7,18 @@
 **E-Mail** : bagsuhyeon271@gmail.com  
 **Repository** : [TypeSecure_22412002_suhyun](https://github.com/su-hyun617/TypeSecure_22412002)
 
+<br>
+<br>
+<br>
+<br>
+
+## Revision History
+|Revision date|Version|Description|Author|
+|-|-|-|-|
+|03/17/2026|1.0.0|First Draft|박수현|
+
 </div>
+
 
 <br>
 <br>
