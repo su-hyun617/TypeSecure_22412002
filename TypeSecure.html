@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>TypeSecure - Adaptive Biometrics</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .container { background: white; padding: 40px; border-radius: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); width: 800px; }
+        .progress-text { font-size: 1.2rem; color: #333; margin-bottom: 30px; font-weight: 500; }
+        .target-display { font-size: 3rem; font-weight: bold; color: #000; margin-bottom: 25px; min-height: 70px; }
+        input { width: 100%; padding: 18px; border: 2px solid #dee2e6; border-radius: 10px; font-size: 1.5rem; box-sizing: border-box; margin-bottom: 15px; }
+        input:focus { border-color: #ced4da; outline: none; }
+        button { padding: 8px 15px; background: #efefef; border: 1px solid #767676; border-radius: 2px; cursor: pointer; font-size: 1rem; }
+        button:active { background: #d5d5d5; }
+        .info-panel { margin-top: 15px; color: #666; font-size: 0.9rem; }
+        #chart-container { margin-top: 30px; display: none; }
+        .btn-next { background: #4CAF50; color: white; border: none; padding: 12px 25px; border-radius: 5px; margin-top: 10px; display: none; font-weight: bold; }
+        .select-zone { margin-bottom: 15px; display: none; }
+        select { padding: 10px; font-size: 1rem; border-radius: 5px; width: 100%; border: 2px solid #dee2e6; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="progress-text" id="progressArea">학습 진행도: <span id="count">0</span> / 5</div>
+
+    <div class="select-zone" id="selectZone">
+        <label for="wordSelect" style="font-weight: bold; display:block; margin-bottom:5px;">인증할 문구 선택:</label>
+        <select id="wordSelect" onchange="display.changeAuthTarget()"></select>
+    </div>
+
+    <div class="target-display" id="targetText">Hello, world!</div>
+
+    <input type="text" id="main-input" autocomplete="off" placeholder="위 문구를 입력하세요.">
+
+    <div class="button-area">
+        <button id="learnBtn">학습하기</button>
+        <button id="auth-mode-btn" class="btn-next" onclick="display.startAuthMode()">인증하기 단계로 이동</button>
+    </div>
+
+    <div id="info" class="info-panel"></div>
+    <div id="chart-container">
+        <canvas id="rhythmChart"></canvas>
+    </div>
+</div>
+
+<script>
+    const appState = {
+        mode: 'REG',   
+        chart: null,
+    };
+
+    const CONFIG = {
+        REG_ROUNDS: 5,          
+        AUTH_THRESHOLD: 75,     
+        SHIFT_WEIGHT: 0.5,      
+        ADAPT_MAX_HISTORY: 10,  
+    };
+
+    const textSource = {
+        words: [
+            "Hello, world!",
+            "Yeungnam",
+            "University",
+            "Computer",
+            "TypeSecure"
+        ],
+        getText(index) {
+            return this.words[index] ?? "";
+        }
+    };
+
+    const rhythmBuffer = {
+        logs: [],
+        append(key, time) {
+            this.logs.push({ key, time });
+        },
+        discard() {
+            this.logs = [];
+            document.getElementById('main-input').value = "";
+        },
+        getLogs() {
+            return [...this.logs];
+        }
+    };
+
+    const typeCheck = {
+        verify(inputStr, targetStr) {
+            return inputStr === targetStr;
+        }
+    };
+
+    const makePattern = {
+        process(logs) {
+            return logs.slice(1).map((log, i) => log.time - logs[i].time);
+        }
+    };
+
+    const similarity = {
+        calculate(base, current) {
+            if (!base || !current || base.length !== current.length) return -1;
+            const n = base.length;
+            const dtw = Array.from({ length: n + 1 }, () => new Array(n + 1).fill(Infinity));
+            dtw[0][0] = 0;
+
+            for (let i = 1; i <= n; i++) {
+                for (let j = 1; j <= n; j++) {
+                    const cost = Math.abs(base[i - 1] - current[j - 1]);
+                    dtw[i][j] = cost + Math.min(dtw[i - 1][j], dtw[i][j - 1], dtw[i - 1][j - 1]);
+                }
+            }
+
+            const normalizedDist = dtw[n][n] / n;
+            return Math.round(Math.max(0, 100 - normalizedDist / 2));
+        }
+    };
+
+    const patternUpdate = {
+        masterPatternStorage: {},
+        historyCounts: {},
+        registeredCount: 0,
+
+        save(word, pattern) {
+            this.masterPatternStorage[word] = [...pattern];
+            this.historyCounts[word] = 1;
+            this.registeredCount++;
+        },
+
+        accumulate(word, newPattern) {
+            if (!this.masterPatternStorage[word]) return;
+            const count = this.historyCounts[word];
+            const effectiveCount = Math.min(count, CONFIG.ADAPT_MAX_HISTORY);
+            const alpha = 2 / (effectiveCount + 1);
+
+            this.masterPatternStorage[word] = this.masterPatternStorage[word].map(
+                (val, i) => val * (1 - alpha) + newPattern[i] * alpha
+            );
+            this.historyCounts[word] = count + 1;
+        },
+
+        getPattern(word) {
+            return this.masterPatternStorage[word] ?
+                [...this.masterPatternStorage[word]] : null;
+        },
+
+        getCount() {
+            return this.registeredCount;
+        }
+    };
+
+    const display = {
+        currentTarget: textSource.getText(0),
+
+        getCurrentTarget() {
+            return this.currentTarget;
+        },
+
+        refreshTarget(text) {
+            this.currentTarget = text;
+            document.getElementById('targetText').innerText = text;
+        },
+
+        updateProgress(count) {
+            document.getElementById('count').innerText = count;
+            document.getElementById('info').innerText =
+                `성공! 다음 문장을 정확히 입력하세요. (${count}/5 완료)`;
+        },
+
+        enableAuthTransition() {
+            document.getElementById('learnBtn').style.display = 'none';
+            document.getElementById('auth-mode-btn').style.display = 'block';
+            document.getElementById('targetText').innerText = "학습 완료!";
+            document.getElementById('info').innerHTML =
+                "<b>보안 생체 데이터 학습 완료!</b> 아래 버튼을 눌러 인증 단계로 이동하세요.";
+        },
+
+        startAuthMode() {
+            appState.mode = 'AUTH';
+            document.getElementById('auth-mode-btn').style.display = 'none';
+            document.getElementById('progressArea').style.display = 'none';
+
+            const selectZone = document.getElementById('selectZone');
+            const wordSelect = document.getElementById('wordSelect');
+            selectZone.style.display = 'block';
+            wordSelect.innerHTML = textSource.words
+                .map(w => `<option value="${w}">${w}</option>`)
+                .join('');
+            this.changeAuthTarget();
+        },
+
+        changeAuthTarget() {
+            const selectedWord = document.getElementById('wordSelect').value;
+            this.refreshTarget(selectedWord);
+            document.getElementById('main-input').placeholder = `'${selectedWord}' 문장을 입력하세요.`;
+            document.getElementById('info').innerText =
+                `선택된 [${selectedWord}] 문구의 기저 데이터와 실시간 인증을 진행합니다.`;
+            document.getElementById('chart-container').style.display = 'none';
+        },
+
+        printMessage(htmlMsg, chartData) {
+            document.getElementById('info').innerHTML = htmlMsg;
+            if (chartData) {
+                this.renderChart(chartData.base, chartData.current, chartData.word);
+            } else {
+                document.getElementById('chart-container').style.display = 'none';
+            }
+        },
+
+        renderChart(base, current, word) {
+            document.getElementById('chart-container').style.display = 'block';
+            const ctx = document.getElementById('rhythmChart').getContext('2d');
+            if (appState.chart) appState.chart.destroy();
+
+            const labels = Array.from({ length: word.length - 1 },
+                (_, i) => `${word[i]} → ${word[i + 1]}`);
+            appState.chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [
+                        { label: '학습된 기준 프로필', data: base, borderColor: '#3498db', tension: 0.2 },
+                        { label: '현재 입력 스트림 리듬', data: current, borderColor: '#e74c3c', tension: 0.2 }
+                    ]
+                }
+            });
+        }
+    };
+
+    const result = {
+        output(word, base, current, score) {
+            if (score === -1) {
+                display.printMessage(`<b style="color:red">인증 실패</b> (패턴 크기 불일치)`, null);
+                return;
+            }
+
+            const passed = score >= CONFIG.AUTH_THRESHOLD;
+            const scoreColor = passed ? 'green' : 'red';
+            const verdict = passed
+                ? `<span style="color:green; font-weight:bold;">인증 성공 (본인 확인 완료)</span>`
+                : `<span style="color:red; font-weight:bold;">인증 실패 (타인 의심)</span>`;
+            const msg = `검증 문구: [${word}] <br>리듬 유사도: <b style="color:${scoreColor}">${score}%</b> — ${verdict}`;
+            
+            display.printMessage(msg, { base, current, word });
+        }
+    };
+
+    const inputKey = {
+        _shiftDownTime: null,
+
+        init() {
+            const inputEl = document.getElementById('main-input');
+            inputEl.addEventListener('keydown', (e) => {
+                if (e.isComposing) return;
+
+                if (e.key === 'Backspace' || e.key === 'Delete') {
+                    e.preventDefault();
+                    rhythmBuffer.discard();
+                    this._shiftDownTime = null;
+                    
+                    document.getElementById('info').innerHTML = 
+                        `<b style="color:orange">⚠ 수정키 사용 검출: 입력 데이터가 즉시 파기되었습니다. 처음부터 다시 입력하세요.</b>`;
+                    return;
+                }
+
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    this._shiftDownTime = null;
+                    inputKey.submit();
+                    return;
+                }
+
+                if (e.key === 'Shift') {
+                    this._shiftDownTime = performance.now();
+                    return;
+                }
+
+                if (e.key.length === 1) {
+                    let t = performance.now();
+                    if (this._shiftDownTime !== null) {
+                        t = this._shiftDownTime * CONFIG.SHIFT_WEIGHT + t * (1 - CONFIG.SHIFT_WEIGHT);
+                        this._shiftDownTime = null;
+                    }
+                    rhythmBuffer.append(e.key, t);
+                }
+            });
+
+            inputEl.addEventListener('keyup', (e) => {
+                if (e.key === 'Shift') this._shiftDownTime = null;
+            });
+
+            document.getElementById('learnBtn').addEventListener('click', () => {
+                inputKey.submit();
+            });
+        },
+
+        submit() {
+            const inputVal = document.getElementById('main-input').value;
+            const currentTarget = display.getCurrentTarget();
+
+            if (!typeCheck.verify(inputVal, currentTarget)) {
+                alert("오타가 발생했습니다! 문구를 정확하게 다시 입력하세요.");
+                rhythmBuffer.discard();
+                return;
+            }
+
+            const logs = rhythmBuffer.getLogs();
+            if (logs.length < 2) {
+                alert("데이터가 유효하지 않습니다. 다시 입력하세요.");
+                rhythmBuffer.discard();
+                return;
+            }
+
+            const intervals = makePattern.process(logs);
+            if (appState.mode === 'REG') {
+                patternUpdate.save(currentTarget, intervals);
+                const nextCount = patternUpdate.getCount();
+                display.updateProgress(nextCount);
+
+                if (nextCount >= CONFIG.REG_ROUNDS) {
+                    display.enableAuthTransition();
+                } else {
+                    display.refreshTarget(textSource.getText(nextCount));
+                }
+
+            } else if (appState.mode === 'AUTH') {
+                const basePattern = patternUpdate.getPattern(currentTarget);
+                const score = similarity.calculate(basePattern, intervals);
+                
+                if (score >= CONFIG.AUTH_THRESHOLD) {
+                    patternUpdate.accumulate(currentTarget, intervals);
+                }
+
+                result.output(currentTarget, basePattern, intervals, score);
+            }
+
+            rhythmBuffer.discard();
+        }
+    };
+
+    inputKey.init();
+</script>
+</body>
+</html>
